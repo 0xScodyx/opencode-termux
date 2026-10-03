@@ -111,7 +111,7 @@ TARGET="linux-arm64"   # glibc-сборка: нужен только libc.so.6 (
 # -ENOSYS, и opencode идёт по штатному fallback'у. Собран без libc, поэтому
 # безвреден для bionic-процессов (git, sh), которые opencode запускает.
 SHIM_NAME="sigsys-shim-arm64.so"
-SHIM_URL="https://raw.githubusercontent.com/scodyx/opencode-termux/main/$SHIM_NAME"
+SHIM_URL="https://raw.githubusercontent.com/0xScodyx/opencode-termux/main/$SHIM_NAME"
 SHIM_SHA256="cbb48c6a1bec2323a25fc01723d056b2d2153e01037c2a1db13953a65ddf9a6b"
 
 WORK=""
