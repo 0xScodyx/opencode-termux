@@ -28,7 +28,7 @@ bash opencode-termux.sh
 | 2 | в бинаре зашит интерпретатор `/lib/ld-linux-aarch64.so.1` | на Android такого файла нет вообще |
 | 3 | opencode собран под glibc, а Termux — это bionic | несовместимые libc |
 
-Частая ошибка на форумах — «бинарь не PIE, Android его не запустит в принципе». Обойти это можно: ядро Android грузит ELF-бинарь, а не bionic, поэтому достаточно подсунуть **настоящий glibc-загрузчик** через `PT_INTERP`. Нативных syscall'ов Android не блокирует, так что opencode работает напрямую.
+Частая ошибка на форумах — «бинарь не PIE, Android его не запустит в принципе». Обойти это можно: ядро Android грузит ELF-бинарь, а не bionic, поэтому достаточно подсунуть **настоящий glibc-загрузчик** через `PT_INTERP`, и opencode работает напрямую, без эмуляции. Но остаётся **seccomp-политика Android**: часть syscall'ов она запрещает, и там процесс умирает с `SIGSYS` — см. раздел [«Если что-то пошло не так»](#если-что-то-пошло-не-так).
 
 ## Что делает скрипт
 
@@ -36,7 +36,7 @@ bash opencode-termux.sh
 2. Определяет последнюю версию через `https://opencode.ai/update/api/latest/cli/npm`.
 3. Скачивает tarball `@opencode/cli-linux-arm64` с npm и сверяет **sha512** с тем, что отдаёт registry (fallback — sha1 из `dist.shasum`).
 4. **Точечно правит `PT_INTERP`** в бинаре: строка интерпретатора записывается поверх `.interp` + `.note`, у сегмента расширяется `p_filesz`. Сегменты, `vaddr` и все смещения файла остаются нетронутыми.
-5. Создаёт обёртку в `$PREFIX/bin/opencode`, которая снимает `LD_PRELOAD` (bionic-библиотеки ломают glibc-процесс), выставляет `LD_LIBRARY_PATH` на glibc и `TMPDIR=$PREFIX/tmp` (в Android нет `/tmp`, а Bun распаковывает туда нативный модуль OpenTUI).
+5. Создаёт обёртку в `$PREFIX/bin/opencode`, которая снимает `LD_PRELOAD` (bionic-библиотеки ломают glibc-процесс), задаёт `TMPDIR=$PREFIX/tmp` (в Android нет `/tmp`, а Bun распаковывает туда нативный модуль OpenTUI) и передаёт `LD_LIBRARY_PATH` на glibc **только самому opencode** — не экспортируя его в окружение оболочки.
 6. Перехватывает `opencode upgrade`: встроенный upgrade снёс бы правку интерпретатора, поэтому переустановка идёт этим же скриптом.
 
 ### Почему не `patchelf`
@@ -80,6 +80,7 @@ opencode — non-PIE `ET_EXEC` с зашитыми в код абсолютны�
     --skip-checksum   не проверять sha512 tarball
     --keep-tmp        не удалять временные файлы
     --uninstall       удалить opencode и обёртки
+    --diag            собрать диагностику и найти заблокированный syscall
 -h, --help            справка
 ```
 
@@ -100,7 +101,9 @@ opencode — non-PIE `ET_EXEC` с зашитыми в код абсолютны�
 
 ### `opencode убит сигналом SIGSYS` / `invalid system call`
 
-Это Android seccomp: система запрещает часть syscall'ов, а Bun их вызывает. Установка при этом успешная — падает только конкретный процесс (обычно фоновый сервер).
+Это Android seccomp: система запрещает часть syscall'ов, а opencode их вызывает. Установка при этом успешная — падает процесс.
+
+Проблема зависит от устройства: на многих телефонах ничего не блокируется и opencode работает, на некоторых (обычно старые ядра или прошивки вендоров со строгой политикой) умирает конкретный процесс — чаще всего фоновый сервер, но на части устройств даже `opencode --version` убивается.
 
 ```bash
 opencode --standalone   # приватный сервер вместо фонового сервиса
@@ -108,13 +111,31 @@ opencode mini           # минимальный интерфейс
 export OPENCODE_STANDALONE=1   # то же самое постоянно
 ```
 
-Если не помогло — вычислить конкретный syscall:
+Если не помогло, скрипт найдёт заблокированный syscall сам — он печатает окружение, запускает opencode под `strace` и называет тот вызов, на котором процесс погиб:
+
+```bash
+bash opencode-termux.sh --diag
+```
+
+Вручную то же самое:
 
 ```bash
 pkg install strace
 strace -f -o $PREFIX/tmp/oc.strace opencode serve
 tail -3 $PREFIX/tmp/oc.strace
 ```
+
+Если opencode не стартует — приложите вывод `--diag` в [issue](https://github.com/0xScodyx/opencode-termux/issues): знание конкретного syscall'а — это почти всегда половина решения.
+
+### `CANNOT LINK EXECUTABLE "cat": ... has bad ELF magic`
+
+Значит `LD_LIBRARY_PATH` на glibc экспортирован в вашей оболочке (вручную или через `source` обёртки). У Android libc называется `libc.so`, поэтому Termux-утилиты подхватывают glibc-овский `libc.so` (это текстовый линкер-скрипт) и падают. Лечится так:
+
+```bash
+unset LD_LIBRARY_PATH
+```
+
+Обёртка специально не экспортирует его глобально: `LD_LIBRARY_PATH` передаётся только самому opencode, поэтому ваша оболочка и утилиты Termux остаются чистыми.
 
 ### Чёрный экран TUI
 

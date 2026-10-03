@@ -26,7 +26,7 @@ The official installer (`curl -fsSL https://opencode.ai/v2/install | bash`) does
 | 2 | the binary hardcodes `/lib/ld-linux-aarch64.so.1` as its interpreter | that file does not exist on Android at all |
 | 3 | opencode is built against glibc, Termux is bionic | incompatible libc |
 
-A common claim on forums is that "the binary isn't PIE, so Android can never run it". That is not true. The Android **kernel** loads ELF binaries, not bionic, so all you need is a real glibc loader pointed at by `PT_INTERP`. Android does not block native syscalls, so opencode runs directly — no emulation layer.
+A common claim on forums is that "the binary isn't PIE, so Android can never run it". That is not true. The Android **kernel** loads ELF binaries, not bionic, so all you need is a real glibc loader pointed at by `PT_INTERP`. opencode then runs directly, with no emulation layer. What still applies is Android's **seccomp policy**: it forbids some syscalls, and where that happens the process dies with `SIGSYS` — see [Troubleshooting](#troubleshooting).
 
 ## What the script does
 
@@ -78,6 +78,7 @@ After the patch, `readelf -lW` shows exactly one difference — `INTERP p_filesz
     --skip-checksum   skip tarball sha512 verification
     --keep-tmp        do not remove temporary files
     --uninstall       remove opencode and the launchers
+    --diag            diagnose the environment and find the blocked syscall
 -h, --help            show help
 ```
 
@@ -98,7 +99,9 @@ Override the threshold with `OPENCODE_MIN_FREE_MB=500 bash opencode-termux.sh`.
 
 ### `opencode killed by SIGSYS` / `invalid system call`
 
-This is Android's seccomp policy: the system forbids some syscalls that Bun makes. The installation itself succeeded — only a specific process dies (usually the background server).
+This is Android's seccomp policy: the system forbids some syscalls that opencode makes. The installation itself succeeded — a process dies.
+
+It is device-specific: on many phones nothing is blocked and opencode runs fine, on some (usually older kernels, or vendor ROMs with a stricter policy) a specific process dies — most often the background server, but on some devices even `opencode --version` is killed.
 
 ```bash
 opencode --standalone   # private server instead of the background service
@@ -106,13 +109,31 @@ opencode mini           # minimal interface
 export OPENCODE_STANDALONE=1   # same thing, permanently
 ```
 
-If that doesn't help, find the exact syscall:
+If that doesn't help, the script can find the blocked syscall for you — it prints the environment, runs opencode under `strace` and names the call that was killed:
+
+```bash
+bash opencode-termux.sh --diag
+```
+
+Or do it by hand:
 
 ```bash
 pkg install strace
 strace -f -o $PREFIX/tmp/oc.strace opencode serve
 tail -3 $PREFIX/tmp/oc.strace
 ```
+
+Please [open an issue](https://github.com/0xScodyx/opencode-termux/issues) with the `--diag` output if opencode does not start — knowing the exact syscall is what makes such a device fixable.
+
+### `CANNOT LINK EXECUTABLE "cat": ... has bad ELF magic`
+
+You exported `LD_LIBRARY_PATH` to the glibc directory yourself, or sourced the launcher. Android's libc is named `libc.so`, so Termux utilities pick up glibc's `libc.so` (a text linker script) and fail. Unset it:
+
+```bash
+unset LD_LIBRARY_PATH
+```
+
+The launcher never sets it globally on purpose — it passes it to opencode alone, so your shell and Termux utilities stay clean.
 
 ### Black TUI screen
 

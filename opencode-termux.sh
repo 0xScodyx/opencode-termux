@@ -39,6 +39,7 @@ FORCE=0
 UNINSTALL=0
 SKIP_SUM=0
 KEEP_TMP=0
+DIAG=0
 
 RED=""; GRN=""; YLW=""; DIM=""; BLD=""; NC=""
 if [ -t 1 ] && [ "${NO_COLOR:-}" = "" ]; then
@@ -64,6 +65,7 @@ ${BLD}opencode installer for Termux / Android aarch64${NC}
       --skip-checksum   не проверять sha512 tarball
       --keep-tmp        не удалять временные файлы
       --uninstall       удалить opencode и обёртки
+      --diag            собрать диагностику и найти заблокированный syscall
   -h, --help            эта справка
 EOF
 }
@@ -77,6 +79,7 @@ while [ $# -gt 0 ]; do
     --skip-checksum) SKIP_SUM=1; shift ;;
     --keep-tmp)   KEEP_TMP=1; shift ;;
     --uninstall)  UNINSTALL=1; shift ;;
+    --diag)       DIAG=1; shift ;;
     *) die "Неизвестная опция: $1 (см. --help)" ;;
   esac
 done
@@ -207,7 +210,110 @@ elf_set_interp() { # $1 = файл, $2 = новый путь к загрузчи
   ok "PT_INTERP: offset=$off, p_filesz $fsz -> $need, свободно было $((avail - off)) байт"
 }
 
-# ── 0. Uninstall ──────────────────────────────────────────────────────────────
+GLIBC_DIR="$PREFIX/glibc"
+LOADER=""
+
+find_loader() {
+  local c
+  for c in \
+    "$GLIBC_DIR/lib/ld-linux-aarch64.so.1" \
+    "$GLIBC_DIR/lib64/ld-linux-aarch64.so.1" \
+    "$GLIBC_DIR/lib/aarch64-linux-gnu/ld-linux-aarch64.so.1" \
+    "$GLIBC_DIR/bin/ld.so"; do
+    [ -f "$c" ] && { LOADER="$c"; return 0; }
+  done
+  return 1
+}
+
+# ── 1. Диагностика ────────────────────────────────────────────────────────────
+# Задача: сказать, что именно ломает opencode на этом устройстве. Самая частая
+# причина — Android seccomp (SIGSYS). Диагностика ставит strace, смотрит, какой
+# syscall был последним перед смертью, и печатает всё одним блоком, удобным
+# для отправки (в issue или в чат).
+if [ "$DIAG" -eq 1 ]; then
+  step "Диагностика окружения"
+  printf 'Android      : %s (SDK %s)\n' \
+    "$(getprop ro.build.version.release 2>/dev/null || echo '?')" \
+    "$(getprop ro.build.version.sdk 2>/dev/null || echo '?')"
+  printf 'Ядро        : %s\n' "$(uname -r)"
+  printf 'Архитектура : %s\n' "$(uname -m)"
+  printf 'Termux      : %s\n' "$(dpkg -s termux 2>/dev/null | awk '/^Version:/{print $2}' || echo '?')"
+  printf 'PREFIX      : %s\n' "$PREFIX"
+
+  LOADER=""
+  find_loader && printf 'glibc       : %s\n' "$LOADER" || printf 'glibc       : НЕ НАЙДЕН (pkg install glibc-repo glibc-runner)\n'
+  if [ -n "$LOADER" ]; then
+    "$LOADER" --version 2>/dev/null | head -1 | sed 's/^/glibc версия: /' || true
+    printf 'библиотеки  : %s\n' "$(ls "$GLIBC_DIR/lib" 2>/dev/null | tr '\n' ' ' | cut -c1-120)"
+  fi
+
+  if [ -f "$REAL_BIN" ]; then
+    printf 'opencode    : %s (%s)\n' "$(du -h "$REAL_BIN" | cut -f1)" "$REAL_BIN"
+    printf 'интерпретатор: %s\n' "$(elf_interp "$REAL_BIN" 2>/dev/null || echo '?')"
+  else
+    printf 'opencode    : не установлен\n'
+    printf '              (установить: bash %s)\n' "${BASH_SOURCE[0]:-$0}"
+  fi
+
+  if [ ! -x "$REAL_BIN" ]; then
+    cat <<EOF
+
+${DIM}Проверить glibc и окружение, opencode пока не установлен — см. блок выше.${NC}
+EOF
+    exit 0
+  fi
+
+  step "Ищу заблокированный syscall"
+  if ! command -v strace >/dev/null 2>&1; then
+    log "Ставлю strace"
+    pkg install -y strace >/dev/null 2>&1 || apt install -y strace >/dev/null 2>&1 || true
+  fi
+
+  TRACE="$PREFIX/tmp/opencode-diag.strace"
+  rm -f "$TRACE"
+  if command -v strace >/dev/null 2>&1; then
+    # -E задаёт переменные окружения только самому opencode. Через env нельзя:
+    # strace — это bionic-бинарь, и glibc-путь в его окружении заставил бы
+    # Android-linker искать glibc-овский libc.so (текстовый скрипт) — ровно та
+    # ошибка "CANNOT LINK EXECUTABLE ... has bad ELF magic", что была у друга.
+    strace -f -o "$TRACE" \
+      -E LD_LIBRARY_PATH="$(dirname "$LOADER")" \
+      -E TMPDIR="${TMPDIR:-$PREFIX/tmp}" \
+      -E LD_PRELOAD= \
+      "$REAL_BIN" --version >/dev/null 2>&1 || true
+    printf '\n%s\n' "--- последние вызовы перед смертью (strace) ---"
+    if [ -s "$TRACE" ]; then
+      tail -6 "$TRACE" | sed 's/^/  /'
+    else
+      printf '  (strace ничего не записал — попробуй запустить opencode руками под strace)\n'
+    fi
+    printf '\n%s\n' "--- вердикт ---"
+    if grep -q 'killed by SIGSYS' "$TRACE" 2>/dev/null; then
+      last="$(grep -B1 'killed by SIGSYS' "$TRACE" | head -1 | sed 's/^[0-9]* //; s/(.*//')"
+      printf '  Android seccomp убил процесс на syscall: %s\n' "${last:-неизвестно}"
+      cat <<'EOF'
+
+  Что делать:
+    • opencode --standalone     приватный сервер вместо фонового сервиса
+    • opencode mini             минимальный интерфейс
+    • bash ~/.opencode/install-termux.sh --method proot
+    • отправь этот блок в issue: https://github.com/0xScodyx/opencode-termux/issues
+EOF
+    elif grep -q 'killed by SIGSEGV' "$TRACE" 2>/dev/null; then
+      printf '  Процесс упал с SIGSEGV — бинарь собран не под glibc или сломана правка интерпретатора.\n'
+    elif [ -s "$TRACE" ]; then
+      printf '  SIGSYS не detected — смотри последние вызовы выше.\n'
+    fi
+    printf '\nПолный лог: %s\n' "$TRACE"
+  else
+    printf 'strace не установился. Поставь вручную:\n  pkg install strace\n'
+    printf 'затем: strace -f -o %s -E LD_LIBRARY_PATH=%s %s --version\n' \
+      "$TRACE" "$(dirname "$LOADER")" "$REAL_BIN"
+  fi
+  exit 0
+fi
+
+# ── 2. Uninstall ──────────────────────────────────────────────────────────────
 if [ "$UNINSTALL" -eq 1 ]; then
   step "Удаление opencode"
   rm -f "$BIN_DIR/$APP" "$BIN_DIR/opencode2" "$SHIM_DIR/$APP" "$SHIM_DIR/opencode2" \
@@ -217,7 +323,7 @@ if [ "$UNINSTALL" -eq 1 ]; then
   exit 0
 fi
 
-# ── 1. Проверки окружения ─────────────────────────────────────────────────────
+# ── 1b. Проверки окружения ─────────────────────────────────────────────────────
 step "Проверка окружения"
 
 if [ ! -d "$PREFIX" ] || ! printf '%s' "$PREFIX" | grep -q 'termux'; then
@@ -244,22 +350,8 @@ if ! command -v gzip >/dev/null 2>&1; then
 fi
 mkdir -p "$BIN_DIR" "$LIBEXEC_DIR" "$SHIM_DIR"
 
-GLIBC_DIR="$PREFIX/glibc"
-LOADER=""
 
-find_loader() {
-  local c
-  for c in \
-    "$GLIBC_DIR/lib/ld-linux-aarch64.so.1" \
-    "$GLIBC_DIR/lib64/ld-linux-aarch64.so.1" \
-    "$GLIBC_DIR/lib/aarch64-linux-gnu/ld-linux-aarch64.so.1" \
-    "$GLIBC_DIR/bin/ld.so"; do
-    [ -f "$c" ] && { LOADER="$c"; return 0; }
-  done
-  return 1
-}
-
-# ── 2. Зависимости: glibc ────────────────────────────────────────────────────
+# ── 3. Зависимости: glibc ────────────────────────────────────────────────────
 step "Зависимости (glibc)"
 
 if find_loader && [ -f "$(dirname "$LOADER")/libc.so.6" ]; then
@@ -283,7 +375,7 @@ fi
 GLIBC_LIB="$(dirname "$LOADER")"
 [ -f "$GLIBC_LIB/libc.so.6" ] || warn "Не найден $GLIBC_LIB/libc.so.6 — проверьте пакет glibc-runner"
 
-# ── 2b. Метод proot ───────────────────────────────────────────────────────────
+# ── 4. Метод proot ───────────────────────────────────────────────────────────
 if [ "$METHOD" = proot ]; then
   step "Метод proot (glibc-окружение целиком)"
   DISTRO=proot-distro
@@ -301,7 +393,7 @@ EOF
   exit 0
 fi
 
-# ── 3. Версия и tarball ───────────────────────────────────────────────────────
+# ── 5. Версия и tarball ───────────────────────────────────────────────────────
 step "Определяю версию"
 
 if [ -z "$REQ_VERSION" ]; then
@@ -344,7 +436,7 @@ done
 WORK="$(mktemp -d "${TMPDIR:-$PREFIX/tmp}/opencode-termux.XXXXXX")"
 log "Каталог: $WORK"
 
-# ── 4. Проверка места ─────────────────────────────────────────────────────────
+# ── 6. Проверка места ─────────────────────────────────────────────────────────
 # Раскладка по диску во время установки (пик ~400 МБ):
 #   обычный режим:  $WORK/cli.tgz ~86 МБ + $REAL_BIN.tmp ~191 МБ  → пик ~280 МБ
 #   потоковый режим: curl | tar сразу в $REAL_BIN.tmp               → пик ~200 МБ
@@ -371,7 +463,7 @@ if [ -n "$avail_mb" ]; then
   fi
 fi
 
-# ── 5. Скачивание + проверка целостности ──────────────────────────────────────
+# ── 7. Скачивание + проверка целостности ──────────────────────────────────────
 CURL_PROGRESS=(-fsSL)
 [ -t 2 ] && CURL_PROGRESS=(-fL --progress-bar)
 
@@ -413,7 +505,7 @@ verify_sha1() {
   fi
 }
 
-# ── 6. Распаковка сразу в цель + патч интерпретатора ─────────────────────────
+# ── 8. Распаковка сразу в цель + патч интерпретатора ─────────────────────────
 # Не распаковываем архив целиком и не делаем лишних копий: нужный файл пишется
 # сразу в $REAL_BIN.tmp, а tarball удаляется сразу после распаковки.
 step "Скачивание и распаковка (~200 МБ)"
@@ -464,7 +556,7 @@ ok "Бинарь: $REAL_BIN ($(du -h "$REAL_BIN" | cut -f1))"
 ok "интерпретатор: $INTERP_NEW"
 ok "библиотеки: $GLIBC_LIB (через LD_LIBRARY_PATH в обёртке)"
 
-# ── 7. Обёртка ────────────────────────────────────────────────────────────────
+# ── 9. Обёртка ────────────────────────────────────────────────────────────────
 step "Обёртка запуска"
 
 # Обёртка нужна, чтобы: снять LD_PRELOAD от Termux (bionic .so ломает glibc-процесс),
@@ -490,9 +582,10 @@ if [ "\${OPENCODE_UPGRADE_HOOK:-1}" != 0 ] && [ "\${1:-}" = upgrade ] && [ -f "\
   exec bash "\$INSTALLER" --force
 fi
 
-unset LD_PRELOAD
-LD_LIBRARY_PATH="\$PREFIX/glibc/lib\${LD_LIBRARY_PATH:+:\$LD_LIBRARY_PATH}"
-export LD_LIBRARY_PATH
+# LD_LIBRARY_PATH задаём только для самого opencode (через env), иначе он утёк бы
+# в bionic-процессы: Android'овская libc называется libc.so, и Termux-утилиты
+# (cat, ls, grep) начали бы падать с "bad ELF magic".
+# LD_PRELOAD из bionic .so тоже снимаем — по той же причине.
 if [ -z "\${TMPDIR:-}" ]; then TMPDIR="\$PREFIX/tmp"; export TMPDIR; fi
 [ -x "\$REAL" ] || { echo "$APP не найден: \$REAL" >&2; exit 127; }
 
@@ -501,7 +594,8 @@ if [ -z "\${TMPDIR:-}" ]; then TMPDIR="\$PREFIX/tmp"; export TMPDIR; fi
 if [ "\${OPENCODE_STANDALONE:-0}" = 1 ] && [ \$# -eq 0 ]; then set -- --standalone; fi
 
 # не exec, а запуск с проверкой кода: так можно объяснить, что именно убило процесс
-"\$REAL" "\$@"
+env -u LD_PRELOAD LD_LIBRARY_PATH="\$PREFIX/glibc/lib\${LD_LIBRARY_PATH:+:\$LD_LIBRARY_PATH}" \
+    "\$REAL" "\$@"
 rc=\$?
 if [ "\$rc" -gt 128 ] && [ "\$rc" -le 192 ]; then
   sig=\$((rc - 128))
@@ -563,7 +657,7 @@ for rc in "$HOME/.bashrc" "$HOME/.zshrc"; do
   fi
 done
 
-# ── 8. Проверка запуска ───────────────────────────────────────────────────────
+# ── 10. Проверка запуска ───────────────────────────────────────────────────────
 step "Проверка"
 export TMPDIR="${TMPDIR:-$PREFIX/tmp}"
 
