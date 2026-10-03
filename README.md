@@ -71,14 +71,21 @@ After the patch, `readelf -lW` shows exactly one difference — `INTERP p_filesz
 
 ## Options
 
+The command above works on its own — no flags, nothing to choose. The script
+installs glibc, downloads opencode, checks that it starts, and if this phone's
+Android blocks the syscalls it needs, installs the seccomp shim by itself.
+
+Flags exist as tools, not as decisions you have to make:
+
 ```
--v, --version <ver>   install a specific version (e.g. 2.0.22)
--m, --method <m>      native (default) | proot (fallback)
 -f, --force           reinstall even if this version is already installed
+    --diag            show the environment and why the launch failed (strace)
+    --fix-seccomp     install the Android seccomp shim (usually automatic)
+    --uninstall       remove opencode
+-v, --version <ver>   specific version (e.g. 2.0.22)
+    --method <m>      native | proot — only if you want to set it by hand
     --skip-checksum   skip tarball sha512 verification
     --keep-tmp        do not remove temporary files
-    --uninstall       remove opencode and the launchers
-    --diag            diagnose the environment and find the blocked syscall
 -h, --help            show help
 ```
 
@@ -101,15 +108,19 @@ Override the threshold with `OPENCODE_MIN_FREE_MB=500 bash opencode-termux.sh`.
 
 This is Android's seccomp policy: the system forbids some syscalls that opencode makes. The installation itself succeeded — a process dies.
 
-It is device-specific: on many phones nothing is blocked and opencode runs fine, on some (usually older kernels, or vendor ROMs with a stricter policy) a specific process dies — most often the background server, but on some devices even `opencode --version` is killed.
+It is device-specific: on many phones nothing is blocked and opencode runs fine, on some (more often vendor ROMs with a stricter policy, such as a TECNO Spark Go 1 on Android 14) even `opencode --version` is killed.
+
+The installer recognises this and fixes it by itself: on exit code 159 it installs a **shim** and retries the launch. You don't have to do anything.
+
+The shim is a tiny library that turns the seccomp trap into a plain `-ENOSYS`. It is built without libc and disables itself inside bionic processes (`git`, `sh`), so it cannot harm the child processes opencode spawns. To install or reinstall it by hand:
 
 ```bash
-opencode --standalone   # private server instead of the background service
-opencode mini           # minimal interface
-export OPENCODE_STANDALONE=1   # same thing, permanently
+bash opencode-termux.sh --fix-seccomp
 ```
 
-If that doesn't help, the script can find the blocked syscall for you — it prints the environment, runs opencode under `strace` and names the call that was killed:
+Why that works: Bun (opencode's engine) calls `close_range` at startup and later needs `statx`, `openat2`, `pidfd_open`, `clone3` and `epoll_pwait2`. Each one has a fallback path via `-ENOSYS`, but Android sends `SIGSYS` instead of an error, so the process dies before the fallback can run. The shim rewrites the return register in the `ucontext` to `-ENOSYS`, and Bun takes its own fallback.
+
+If the shim doesn't help, the script can find the blocked syscall for you — it prints the environment, runs opencode under `strace` and names the call that was killed:
 
 ```bash
 bash opencode-termux.sh --diag
@@ -151,15 +162,15 @@ apt clean; apt autoremove -y
 TMPDIR=/path/with/space bash opencode-termux.sh   # different partition
 ```
 
-### Fallback: proot
+### proot — last resort, by hand
 
-If seccomp still blocks the server even with `--standalone`:
+If neither the shim nor the diagnostics help (or you just want an environment that is guaranteed to work):
 
 ```bash
 bash ~/.opencode/install-termux.sh --method proot
 ```
 
-Installs proot-distro with Debian and runs opencode inside it. Slower and needs noticeably more disk space, but the TUI is guaranteed to work.
+Installs proot-distro with Debian and runs opencode inside it. Slower and needs noticeably more disk space, but the TUI is guaranteed to work. The installer never goes there on its own: proot is a deliberate choice, not a silent fallback.
 
 ## Maintenance
 
@@ -182,7 +193,13 @@ $HOME/.opencode/install-termux.sh           installer copy (needed by the upgrad
 
 The full install path was exercised on real aarch64 via `qemu-aarch64` (Docker + `binfmt_misc`, arm64 Ubuntu image): download, unpack, `PT_INTERP` patch, launch, unpacking of the native OpenTUI module into `TMPDIR`, idempotency, `--force`, the upgrade hook, `--uninstall`, and the streaming mode.
 
-Honest limitation: Android's seccomp policy cannot be reproduced in a container, so seccomp behaviour was verified on a physical phone and iterated based on its output.
+The shim was verified in three honest parts, because it cannot be reproduced end to end on an x86-64 host:
+
+1. **The trap mechanism** — against a real host seccomp (`SECCOMP_RET_TRAP` on `close_range`): without the shim the process gets exit 159 (128+SIGSYS), with the shim `close_range` returns `ENOSYS` and the process keeps running.
+2. **Bun's behaviour on `ENOSYS`** — on the real aarch64 opencode binary with a seccomp filter forcing `close_range → ENOSYS`: it starts normally.
+3. **Shim installation on device** — on the real aarch64 binary, the constructor runs, the handler is installed (`rt_sigaction` returns 0) and the launch is not disturbed.
+
+Honest limitation: qemu-user cannot be the source of an aarch64 seccomp trap — the host kernel rejects a filter built for a foreign architecture — so the trap exactly as a phone produces it cannot be installed under qemu. Final verification needs real hardware.
 
 ## Security
 

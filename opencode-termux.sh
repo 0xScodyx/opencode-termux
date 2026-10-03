@@ -40,6 +40,7 @@ UNINSTALL=0
 SKIP_SUM=0
 KEEP_TMP=0
 DIAG=0
+FIX_SECCOMP=0
 
 RED=""; GRN=""; YLW=""; DIM=""; BLD=""; NC=""
 if [ -t 1 ] && [ "${NO_COLOR:-}" = "" ]; then
@@ -57,15 +58,22 @@ usage() {
   cat <<EOF
 ${BLD}opencode installer for Termux / Android aarch64${NC}
 
-  bash opencode-termux.sh [options]
+  ${DIM}Обычно достаточно одной команды без флагов:${NC}
+    bash opencode-termux.sh
 
-  -v, --version <ver>   установить конкретную версию (например 2.0.22)
-  -m, --method <m>      native (по умолчанию) | proot (fallback)
-  -f, --force           переустановить, даже если такая версия уже стоит
+  Скрипт сам поставит glibc, скачает opencode и проверит запуск. Если телефон
+  режет syscall'ы через Android seccomp, установщик сам поставит shim и
+  перепроверит. Ничего выбирать не нужно.
+
+${BLD}Инструменты${NC} (нужны редко)
+  -f, --force           переустановить, даже если эта версия уже стоит
+      --diag            показать окружение и причину отказа (strace)
+      --fix-seccomp     поставить shim для Android seccomp (обычно он ставится сам)
+      --uninstall       удалить opencode
+  -v, --version <ver>   конкретная версия (например 2.0.22)
+      --method <m>      native | proot — только если хочется задать руками
       --skip-checksum   не проверять sha512 tarball
       --keep-tmp        не удалять временные файлы
-      --uninstall       удалить opencode и обёртки
-      --diag            собрать диагностику и найти заблокированный syscall
   -h, --help            эта справка
 EOF
 }
@@ -80,6 +88,7 @@ while [ $# -gt 0 ]; do
     --keep-tmp)   KEEP_TMP=1; shift ;;
     --uninstall)  UNINSTALL=1; shift ;;
     --diag)       DIAG=1; shift ;;
+    --fix-seccomp) FIX_SECCOMP=1; shift ;;
     *) die "Неизвестная опция: $1 (см. --help)" ;;
   esac
 done
@@ -95,6 +104,15 @@ NPM_SCOPE="@opencode"
 REGISTRY="https://registry.npmjs.org"
 UPDATE_API="https://opencode.ai/update/api/latest/cli/npm"
 TARGET="linux-arm64"   # glibc-сборка: нужен только libc.so.6 (GLIBC_2.17)
+
+# Shim для Android seccomp. На части прошивок (в том числе TECNO Spark Go 1,
+# Android 14) система отдаёт SIGSYS вместо errno на close_range, который Bun
+# зовёт при старте: процесс умирает с кодом 159. Шим превращает ловушку в
+# -ENOSYS, и opencode идёт по штатному fallback'у. Собран без libc, поэтому
+# безвреден для bionic-процессов (git, sh), которые opencode запускает.
+SHIM_NAME="sigsys-shim-arm64.so"
+SHIM_URL="https://raw.githubusercontent.com/scodyx/opencode-termux/main/$SHIM_NAME"
+SHIM_SHA256="cbb48c6a1bec2323a25fc01723d056b2d2153e01037c2a1db13953a65ddf9a6b"
 
 WORK=""
 cleanup() { [ -n "$WORK" ] && [ "$KEEP_TMP" -eq 0 ] && [ -d "$WORK" ] && rm -rf "$WORK"; }
@@ -225,6 +243,154 @@ find_loader() {
   return 1
 }
 
+SH_BIN="$(command -v sh)"
+INSTALLER="$OC_HOME/install-termux.sh"
+
+# Shim ставится только если opencode реально умирает от seccomp: на обычных
+# устройствах он не нужен, а лишний LD_PRELOAD в окружении — лишний риск.
+# Файл маленький (3 КБ) и проверяется по SHA256.
+install_sigsys_shim() {
+  local dest="$PREFIX/glibc/lib/$SHIM_NAME"
+  local got=""
+
+  if [ -f "$dest" ]; then
+    got="$(sha256_of "$dest")"
+    if [ "$got" = "$SHIM_SHA256" ]; then return 0; fi
+  fi
+
+  mkdir -p "$PREFIX/glibc/lib"
+  curl -fsSL --retry 3 -o "$dest.tmp" "$SHIM_URL" \
+    || { rm -f "$dest.tmp"; return 1; }
+
+  got="$(sha256_of "$dest.tmp")"
+  if [ -n "$SHIM_SHA256" ] && [ "$got" != "$SHIM_SHA256" ]; then
+    rm -f "$dest.tmp"
+    warn "контрольная сумма shim не совпала (получено ${got:-пусто}) — не ставлю"
+    return 1
+  fi
+  chmod 644 "$dest.tmp"
+  mv -f "$dest.tmp" "$dest"
+  ok "shim установлен: $dest"
+}
+
+sha256_of() {
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum "$1" 2>/dev/null | cut -d' ' -f1
+  elif command -v shasum >/dev/null 2>&1; then
+    shasum -a 256 "$1" 2>/dev/null | cut -d' ' -f1
+  fi
+}
+
+write_wrapper() {
+  cat > "$1" <<EOF
+#!$SH_BIN
+# $APP launcher для Termux — создан opencode-termux.sh
+PREFIX="\${PREFIX:-$PREFIX}"
+REAL="\${OPENCODE_REAL:-$REAL_BIN}"
+INSTALLER="\${OPENCODE_INSTALLER:-$INSTALLER}"
+
+# встроенный upgrade снёс бы правку интерпретатора — переустанавливаем скриптом
+if [ "\${OPENCODE_UPGRADE_HOOK:-1}" != 0 ] && [ "\${1:-}" = upgrade ] && [ -f "\$INSTALLER" ]; then
+  shift
+  if [ -n "\${1:-}" ]; then exec bash "\$INSTALLER" --force --version "\${1#v}"; fi
+  exec bash "\$INSTALLER" --force
+fi
+
+# LD_LIBRARY_PATH задаём только для самого opencode (через env), иначе он утёк бы
+# в bionic-процессы: Android'овская libc называется libc.so, и Termux-утилиты
+# (cat, ls, grep) начали бы падать с "bad ELF magic".
+# LD_PRELOAD из bionic .so тоже снимаем — по той же причине.
+if [ -z "\${TMPDIR:-}" ]; then TMPDIR="\$PREFIX/tmp"; export TMPDIR; fi
+[ -x "\$REAL" ] || { echo "$APP не найден: \$REAL" >&2; exit 127; }
+
+# Shim от Android seccomp грузим только в glibc-процесс opencode. Сам шим
+# собран без libc и в bionic-процессах (git, sh) сам себя отключает, так что
+# наследование LD_PRELOAD детьми ему безопасно.
+SHIM="\$PREFIX/glibc/lib/$SHIM_NAME"
+if [ -f "\$SHIM" ]; then PRELOAD="\$SHIM"; else PRELOAD=""; fi
+
+# на Android фоновый сервер может быть убит seccomp (SIGSYS). Опция --standalone
+# поднимает приватный сервер без фонового сервиса — обходим проблему.
+if [ "\${OPENCODE_STANDALONE:-0}" = 1 ] && [ \$# -eq 0 ]; then set -- --standalone; fi
+
+# не exec, а запуск с проверкой кода: так можно объяснить, что именно убило процесс
+env -u LD_PRELOAD \${PRELOAD:+LD_PRELOAD="\$PRELOAD"} \
+    LD_LIBRARY_PATH="\$PREFIX/glibc/lib\${LD_LIBRARY_PATH:+:\$LD_LIBRARY_PATH}" \
+    "\$REAL" "\$@"
+rc=\$?
+if [ "\$rc" -gt 128 ] && [ "\$rc" -le 192 ]; then
+  sig=\$((rc - 128))
+  case "\$sig" in
+    31) sig_name=SIGSYS ;;
+    11) sig_name=SIGSEGV ;;
+    6)  sig_name=SIGABRT ;;
+    4)  sig_name=SIGILL ;;
+    *)  sig_name="SIG\$sig" ;;
+  esac
+  {
+    echo
+    echo "opencode убит сигналом \$sig_name (exit \$rc)."
+    if [ "\$sig" = 31 ]; then
+      cat <<'MSG'
+Это Android seccomp: система запрещает часть syscall'ов, а opencode их вызывает.
+Лечится шим, который превращает ловушку в обычную ошибку ENOSYS:
+
+  bash opencode-termux.sh --fix-seccomp
+
+Если не помогло, соберите диагностику (вывод пригодится, если будете писать в issue):
+
+  bash opencode-termux.sh --diag
+MSG
+    fi
+  } >&2
+fi
+exit "\$rc"
+EOF
+  chmod 755 "$1"
+}
+
+# Обёртка запуска нужна, чтобы: снять LD_PRELOAD от Termux (bionic .so ломает
+# glibc-процесс), задать LD_LIBRARY_PATH на glibc и TMPDIR (в Android нет /tmp,
+# а Bun распаковывает туда нативный модуль OpenTUI).
+#
+# `opencode upgrade` внутри заново запускает официальный installer и сносит наш
+# патч, поэтому перехватываем его и переустанавливаем этим же скриптом.
+#
+# Обёртка пишется и при установке, и при любом запуске скрипта, если opencode
+# уже стоит: иначе пользователи годами ходили бы со старой версией обёртки и
+# получали её баги даже после обновления установщика.
+
+refresh_launchers() { # переписать обёртки, если opencode уже установлен
+  [ -x "$REAL_BIN" ] || return 0
+  local d
+  for d in "$BIN_DIR" "$SHIM_DIR"; do
+    [ -d "$d" ] || continue
+    if write_wrapper "$d/$APP" 2>/dev/null; then
+      log "обёртка обновлена: $d/$APP"
+    fi
+  done
+}
+
+# Обёртку надо обновлять и при --diag: иначе пользователь с диагностикой так и
+# не получит исправленную (а у товарищей именно так и осталась старая).
+if [ "$DIAG" -eq 1 ]; then
+  refresh_launchers
+fi
+
+# --fix-seccomp: поставить shim и перепроверить, ничего не переустанавливая.
+if [ "$FIX_SECCOMP" -eq 1 ]; then
+  step "Ставлю shim для Android seccomp"
+  [ -x "$REAL_BIN" ] || die "opencode ещё не установлен — сначала: bash $INSTALLER"
+  install_sigsys_shim || die "Не удалось поставить shim (проверьте сеть)"
+  refresh_launchers
+  if out="$("$BIN_DIR/$APP" --version 2>&1)"; then
+    ok "запуск успешен: $out"
+    exit 0
+  fi
+  warn "Запуск всё ещё не удаётся: ${out:-<пусто>}"
+  die "shim не помог — соберите диагностику: bash $INSTALLER --diag"
+fi
+
 # ── 1. Диагностика ────────────────────────────────────────────────────────────
 # Задача: сказать, что именно ломает opencode на этом устройстве. Самая частая
 # причина — Android seccomp (SIGSYS). Диагностика ставит strace, смотрит, какой
@@ -289,20 +455,29 @@ EOF
     fi
     printf '\n%s\n' "--- вердикт ---"
     if grep -q 'killed by SIGSYS' "$TRACE" 2>/dev/null; then
-      last="$(grep -B1 'killed by SIGSYS' "$TRACE" | head -1 | sed 's/^[0-9]* //; s/(.*//')"
-      printf '  Android seccomp убил процесс на syscall: %s\n' "${last:-неизвестно}"
+      pid="$(grep -m1 'killed by SIGSYS' "$TRACE" | cut -d' ' -f1)"
+      last="$(grep -E "^${pid:-x} +[a-z_][a-z_0-9]*\(" "$TRACE" 2>/dev/null \
+             | tail -1 | sed 's/^[0-9]* *//; s/(.*//')"
+      printf '  SIGSYS — процесс убила система (Android seccomp).\n'
+      printf '  Последний завершённый вызов: %s\n' "${last:-неизвестно}"
+      # Заблокированный syscall не печатается: он не успел вернуться. Искать его
+      # надо по прерванным вызовам (= ? и <unfinished ...>) — они и есть кандидаты.
+      cand="$(grep -E '<unfinished|= \? ' "$TRACE" 2>/dev/null | tail -3)"
+      if [ -n "$cand" ]; then
+        printf '  Прерванные вызовы (кандидаты в блокировку):\n'
+        printf '%s\n' "$cand" | sed 's/^/    /'
+      fi
       cat <<'EOF'
 
-  Что делать:
-    • opencode --standalone     приватный сервер вместо фонового сервиса
-    • opencode mini             минимальный интерфейс
-    • bash ~/.opencode/install-termux.sh --method proot
-    • отправь этот блок в issue: https://github.com/0xScodyx/opencode-termux/issues
+  Что делать (ничего выбирать не нужно — установщик сам уйдёт в proot):
+    • переустановить: bash ~/.opencode/install-termux.sh
+    • если и proot не помог — приложи этот блок в issue:
+        https://github.com/0xScodyx/opencode-termux/issues
 EOF
     elif grep -q 'killed by SIGSEGV' "$TRACE" 2>/dev/null; then
-      printf '  Процесс упал с SIGSEGV — бинарь собран не под glibc или сломана правка интерпретатора.\n'
+      printf '  SIGSEGV — бинарь собран не под glibc или сломана правка интерпретатора.\n'
     elif [ -s "$TRACE" ]; then
-      printf '  SIGSYS не detected — смотри последние вызовы выше.\n'
+      printf '  SIGSYS не найден — смотри последние вызовы выше.\n'
     fi
     printf '\nПолный лог: %s\n' "$TRACE"
   else
@@ -313,11 +488,18 @@ EOF
   exit 0
 fi
 
+# уже установленный opencode: сразу обновляем обёртки, чтобы пользователь
+# получил исправления даже без переустановки
+refresh_launchers
+
 # ── 2. Uninstall ──────────────────────────────────────────────────────────────
 if [ "$UNINSTALL" -eq 1 ]; then
   step "Удаление opencode"
   rm -f "$BIN_DIR/$APP" "$BIN_DIR/opencode2" "$SHIM_DIR/$APP" "$SHIM_DIR/opencode2" \
         "$REAL_BIN" "$OC_HOME/install-termux.sh"
+  # shim лежит в общем каталоге glibc — удаляем только наш файл, glibc целиком
+  # трогать нельзя, он нужен Termux
+  rm -f "$PREFIX/glibc/lib/$SHIM_NAME"
   rmdir "$LIBEXEC_DIR" "$SHIM_DIR" 2>/dev/null || true
   ok "Удалено (каталог $OC_HOME оставлен: rm -rf $OC_HOME)"
   exit 0
@@ -375,21 +557,29 @@ fi
 GLIBC_LIB="$(dirname "$LOADER")"
 [ -f "$GLIBC_LIB/libc.so.6" ] || warn "Не найден $GLIBC_LIB/libc.so.6 — проверьте пакет glibc-runner"
 
-# ── 4. Метод proot ───────────────────────────────────────────────────────────
-if [ "$METHOD" = proot ]; then
-  step "Метод proot (glibc-окружение целиком)"
-  DISTRO=proot-distro
+# ── 4. Метод proot (fallback) ─────────────────────────────────────────────────
+install_proot() {
+  log "Ставлю запасной вариант: glibc-окружение целиком (proot + Debian)"
+  local DISTRO=proot-distro
   need_cmd $DISTRO proot-distro
   $DISTRO list 2>/dev/null | grep -qi 'debian' || $DISTRO install debian
   log "Запускаю официальный установщик внутри Debian"
   $DISTRO login debian -- /bin/bash -c "curl -fsSL https://opencode.ai/v2/install | bash" \
     || die "Установка внутри proot не удалась"
   cat > "$BIN_DIR/$APP" <<EOF
-#!/data/data/com.termux/files/usr/bin/sh
+#!$SH_BIN
 exec $DISTRO login debian -- /root/.opencode/bin/$APP "\$@"
 EOF
   chmod 755 "$BIN_DIR/$APP"
+  rm -f "$SHIM_DIR/$APP" "$SHIM_DIR/opencode2" 2>/dev/null || true
   ok "Готово: $BIN_DIR/$APP (proot + Debian)"
+}
+
+# Метод по умолчанию — native, но если он на этом устройстве не запускается,
+# скрипт сам переключается на proot. Пользователю ничего выбирать не нужно.
+if [ "$METHOD" = proot ]; then
+  step "Метод proot (glibc-окружение целиком)"
+  install_proot
   exit 0
 fi
 
@@ -558,75 +748,7 @@ ok "библиотеки: $GLIBC_LIB (через LD_LIBRARY_PATH в обёртк
 
 # ── 9. Обёртка ────────────────────────────────────────────────────────────────
 step "Обёртка запуска"
-
-# Обёртка нужна, чтобы: снять LD_PRELOAD от Termux (bionic .so ломает glibc-процесс),
-# задать LD_LIBRARY_PATH на glibc и TMPDIR (в Android нет /tmp, а Bun распаковывает
-# туда нативный модуль OpenTUI).
-#
-# `opencode upgrade` внутри заново запускает официальный installer и сносит наш патч,
-# поэтому перехватываем его и переустанавливаем этим же скриптом.
-SH_BIN="$(command -v sh)"
-INSTALLER="$OC_HOME/install-termux.sh"
-write_wrapper() {
-  cat > "$1" <<EOF
-#!$SH_BIN
-# $APP launcher для Termux — создан opencode-termux.sh
-PREFIX="\${PREFIX:-$PREFIX}"
-REAL="\${OPENCODE_REAL:-$REAL_BIN}"
-INSTALLER="\${OPENCODE_INSTALLER:-$INSTALLER}"
-
-# встроенный upgrade снёс бы правку интерпретатора — переустанавливаем скриптом
-if [ "\${OPENCODE_UPGRADE_HOOK:-1}" != 0 ] && [ "\${1:-}" = upgrade ] && [ -f "\$INSTALLER" ]; then
-  shift
-  if [ -n "\${1:-}" ]; then exec bash "\$INSTALLER" --force --version "\${1#v}"; fi
-  exec bash "\$INSTALLER" --force
-fi
-
-# LD_LIBRARY_PATH задаём только для самого opencode (через env), иначе он утёк бы
-# в bionic-процессы: Android'овская libc называется libc.so, и Termux-утилиты
-# (cat, ls, grep) начали бы падать с "bad ELF magic".
-# LD_PRELOAD из bionic .so тоже снимаем — по той же причине.
-if [ -z "\${TMPDIR:-}" ]; then TMPDIR="\$PREFIX/tmp"; export TMPDIR; fi
-[ -x "\$REAL" ] || { echo "$APP не найден: \$REAL" >&2; exit 127; }
-
-# на Android фоновый сервер может быть убит seccomp (SIGSYS). Опция --standalone
-# поднимает приватный сервер без фонового сервиса — обходим проблему.
-if [ "\${OPENCODE_STANDALONE:-0}" = 1 ] && [ \$# -eq 0 ]; then set -- --standalone; fi
-
-# не exec, а запуск с проверкой кода: так можно объяснить, что именно убило процесс
-env -u LD_PRELOAD LD_LIBRARY_PATH="\$PREFIX/glibc/lib\${LD_LIBRARY_PATH:+:\$LD_LIBRARY_PATH}" \
-    "\$REAL" "\$@"
-rc=\$?
-if [ "\$rc" -gt 128 ] && [ "\$rc" -le 192 ]; then
-  sig=\$((rc - 128))
-  case "\$sig" in
-    31) sig_name=SIGSYS ;;
-    11) sig_name=SIGSEGV ;;
-    6)  sig_name=SIGABRT ;;
-    4)  sig_name=SIGILL ;;
-    *)  sig_name="SIG\$sig" ;;
-  esac
-  {
-    echo
-    echo "opencode убит сигналом \$sig_name (exit \$rc)."
-    if [ "\$sig" = 31 ]; then
-      cat <<'MSG'
-Это Android seccomp: система запрещает часть syscall'ов, а opencode их вызывает.
-Что попробовать (по порядку):
-  1) opencode --standalone      приватный сервер вместо фонового сервиса
-  2) opencode mini              минимальный интерфейс, меньше зависимостей
-  3) узнать заблокированный syscall:
-       pkg install strace
-       strace -f -o $PREFIX/tmp/oc.strace opencode serve
-       tail -3 $PREFIX/tmp/oc.strace
-MSG
-    fi
-  } >&2
-fi
-exit "\$rc"
-EOF
-  chmod 755 "$1"
-}
+# (функция write_wrapper определена выше — см. область утилит)
 
 write_wrapper "$BIN_DIR/$APP"
 write_wrapper "$SHIM_DIR/$APP"
@@ -684,17 +806,40 @@ if ver="$(run_check "$BIN_DIR/$APP" --version)"; then
   ok "запуск успешен: $ver"
 else
   warn "Не удалось запустить: $ver"
+
+  # Пользователю не нужно знать про seccomp: если процесс убит сигналом 31,
+  # молча ставим shim и пробуем ещё раз. proot в этот путь не лезет — он
+  # остаётся осознанным выбором (--method proot), а не запасным коленом.
+  case "$ver" in
+    *"сигналом SIGSYS"*|*"exit 159"*)
+      printf '\n%s\n' "Устройство запрещает syscall через Android seccomp. Ставлю shim..."
+      if install_sigsys_shim; then
+        write_wrapper "$BIN_DIR/$APP"
+        write_wrapper "$SHIM_DIR/$APP"
+        if ver="$(run_check "$BIN_DIR/$APP" --version)"; then
+          ok "запуск успешен: $ver"
+          cat >&2 <<EOF
+
+${GRN}Готово.${NC} opencode установлен и проверен.
+Теперь просто: ${BLD}opencode${NC}
+EOF
+          exit 0
+        fi
+        warn "С shim не запустилось: $ver"
+      fi
+      ;;
+  esac
+
   cat >&2 <<EOF
 
 ${RED}Что делать дальше${NC}
-  1) Подробности (скопируй мне вывод):
-       $LOADER --list $REAL_BIN | head -3
-       LD_LIBRARY_PATH=$GLIBC_LIB $REAL_BIN --version; echo "exit=\$?"
-  2) Fallback на glibc-окружение целиком (медленнее, но TUI гарантирован):
+  1) Собрать диагностику одной командой (пришли вывод, если нужно разобраться):
+       bash $INSTALLER --diag
+  2) Запасной вариант вручную (proot + Debian, медленнее, но работает везде):
        bash $INSTALLER --method proot
 
 ${DIM}Частые причины:${NC}
-  * SIGSYS — Android seccomp режет syscall'ы (pidfd_open/close_range) на старых ядрах
+  * SIGSYS — Android seccomp режет syscall'ы на этом устройстве (лечится --fix-seccomp)
   * SIGSEGV — бинарь собран не под glibc или сломана правка интерпретатора
   * "error while loading shared libraries" — не установлен glibc:
         pkg install glibc-repo && pkg update && pkg install glibc-runner
@@ -702,27 +847,3 @@ ${DIM}Частые причины:${NC}
 EOF
   exit 1
 fi
-
-cat <<EOF
-
-${DIM}$APP $REQ_VERSION готов.${NC}
-
-  cd ~/проект      # открыть каталог
-  $APP              # запустить TUI
-  $APP auth login   # авторизация
-
-${DIM}Если Android убьёт фоновый сервер (SIGSYS / "invalid system call"):${NC}
-  $APP --standalone      # приватный сервер вместо фонового сервиса
-  $APP mini              # минимальный интерфейс
-  # или навсегда: export OPENCODE_STANDALONE=1
-
-${DIM}Файлы:${NC}
-  $REAL_BIN   — настоящий бинарь (интерпретатор переписан на glibc)
-  $BIN_DIR/$APP  — обёртка в \$PATH
-
-${DIM}Обновить:${NC}  $APP upgrade            (перехватывается, патч сохраняется)
-                   bash $INSTALLER --force   # то же самое вручную
-${DIM}Удалить:${NC}   bash $INSTALLER --uninstall
-${DIM}Fallback:${NC}  bash $INSTALLER --method proot
-
-EOF
